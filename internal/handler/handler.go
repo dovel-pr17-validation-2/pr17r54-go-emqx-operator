@@ -1,0 +1,170 @@
+package handler
+
+import (
+	"context"
+
+	"github.com/go-logr/logr"
+
+	emperror "emperror.dev/errors"
+	"github.com/cisco-open/k8s-objectmatcher/patch"
+
+	corev1 "k8s.io/api/core/v1"
+	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/klog/v2"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+)
+
+const (
+	LastAppliedAnnotation = "apps.emqx.io/last-applied"
+)
+
+type Patcher struct {
+	*patch.Annotator
+	patch.Maker
+}
+
+type Handler struct {
+	Patcher *Patcher
+	Client  client.Client
+}
+
+func NewHandler(client client.Client) *Handler {
+	patcher := &Patcher{}
+	patcher.Annotator = patch.NewAnnotator(LastAppliedAnnotation)
+	patcher.Maker = patch.NewPatchMaker(
+		patcher.Annotator,
+		&patch.K8sStrategicMergePatcher{},
+		&patch.BaseJSONMergePatcher{},
+	)
+	return &Handler{
+		Patcher: patcher,
+		Client:  client,
+	}
+}
+
+func (handler *Handler) CreateOrUpdateList(
+	ctx context.Context,
+	scheme *runtime.Scheme,
+	logger logr.Logger,
+	instance client.Object,
+	resources []client.Object,
+) error {
+	for _, resource := range resources {
+		err := handler.CreateOrUpdate(ctx, scheme, logger, instance, resource)
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (handler *Handler) CreateOrUpdate(
+	ctx context.Context,
+	scheme *runtime.Scheme,
+	logger logr.Logger,
+	instance client.Object,
+	obj client.Object,
+) error {
+	if err := ctrl.SetControllerReference(instance, obj, scheme); err != nil {
+		return err
+	}
+
+	u := &unstructured.Unstructured{}
+	u.SetGroupVersionKind(obj.GetObjectKind().GroupVersionKind())
+	err := handler.Client.Get(ctx, client.ObjectKeyFromObject(obj), u)
+	if err != nil {
+		if k8sErrors.IsNotFound(err) {
+			logger.V(1).Info("creating managed resource", "resource", klog.KObj(obj))
+			return handler.Create(ctx, obj)
+		}
+		return emperror.Wrapf(err, "failed to get %s %s", obj.GetObjectKind().GroupVersionKind().Kind, obj.GetName())
+	}
+
+	obj.SetResourceVersion(u.GetResourceVersion())
+	obj.SetCreationTimestamp(u.GetCreationTimestamp())
+	obj.SetManagedFields(u.GetManagedFields())
+	annotations := obj.GetAnnotations()
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
+	for key, value := range u.GetAnnotations() {
+		if _, present := annotations[key]; !present {
+			annotations[key] = value
+		}
+	}
+	obj.SetAnnotations(annotations)
+
+	opts := []patch.CalculateOption{
+		patch.IgnoreStatusFields(),
+	}
+	switch resource := obj.(type) {
+	case *corev1.Service:
+		storageResource := &corev1.Service{}
+		err := runtime.DefaultUnstructuredConverter.FromUnstructured(u.UnstructuredContent(), storageResource)
+		if err != nil {
+			return err
+		}
+		// Required fields when updating service in k8s 1.21
+		if resource.Spec.Type == "" || resource.Spec.Type == corev1.ServiceTypeClusterIP {
+			if storageResource.Spec.ClusterIP != "" {
+				resource.Spec.ClusterIP = storageResource.Spec.ClusterIP
+			}
+		}
+		// If nodePort is not set, will always update service
+		if resource.Spec.Type == corev1.ServiceTypeNodePort || resource.Spec.Type == corev1.ServiceTypeLoadBalancer {
+			nodePortMap := make(map[string]int32)
+			for _, port := range storageResource.Spec.Ports {
+				nodePortMap[port.Name] = port.NodePort
+			}
+			for i, port := range resource.Spec.Ports {
+				if port.NodePort == 0 {
+					if nodePort, ok := nodePortMap[port.Name]; ok {
+						resource.Spec.Ports[i].NodePort = nodePort
+					}
+				}
+			}
+		}
+
+		obj = resource
+	}
+
+	patchResult, err := handler.Patcher.Calculate(u, obj, opts...)
+	if err != nil {
+		return emperror.Wrapf(err, "failed to calculate patch for %s %s",
+			obj.GetObjectKind().GroupVersionKind().Kind,
+			obj.GetName())
+	}
+	if !patchResult.IsEmpty() {
+		logger.V(1).Info("updating managed resource", "resource", klog.KObj(obj), "patch", string(patchResult.Patch))
+		return handler.Update(ctx, obj)
+	}
+	return nil
+}
+
+func (handler *Handler) Create(ctx context.Context, obj client.Object) error {
+	if err := handler.Patcher.SetLastAppliedAnnotation(obj); err != nil {
+		return emperror.Wrapf(err, "failed to set last applied annotation for %s %s",
+			obj.GetObjectKind().GroupVersionKind().Kind,
+			obj.GetName())
+	}
+	if err := handler.Client.Create(ctx, obj); err != nil {
+		return emperror.Wrapf(err, "failed to create %s %s", obj.GetObjectKind().GroupVersionKind().Kind, obj.GetName())
+	}
+	return nil
+}
+
+func (handler *Handler) Update(ctx context.Context, obj client.Object) error {
+	if err := handler.Patcher.SetLastAppliedAnnotation(obj); err != nil {
+		return emperror.Wrapf(err, "failed to set last applied annotation for %s %s",
+			obj.GetObjectKind().GroupVersionKind().Kind,
+			obj.GetName())
+	}
+
+	if err := handler.Client.Update(ctx, obj); err != nil {
+		return emperror.Wrapf(err, "failed to update %s %s", obj.GetObjectKind().GroupVersionKind().Kind, obj.GetName())
+	}
+	return nil
+}

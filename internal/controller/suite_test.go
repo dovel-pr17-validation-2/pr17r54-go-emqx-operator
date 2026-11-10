@@ -1,0 +1,396 @@
+/*
+Copyright 2025-2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"flag"
+	"fmt"
+	"path/filepath"
+	"reflect"
+	"runtime"
+	"testing"
+	"time"
+
+	"emperror.dev/errors"
+	"github.com/go-logr/logr"
+	. "github.com/onsi/ginkgo/v2"
+	. "github.com/onsi/gomega"
+	gomegatypes "github.com/onsi/gomega/types"
+	"go.uber.org/zap/zapcore"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	apiruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	"sigs.k8s.io/controller-runtime/pkg/envtest"
+	controllerlog "sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
+
+	crd "github.com/emqx/emqx-operator/api/v3beta1"
+	"github.com/emqx/emqx-operator/internal/handler"
+	req "github.com/emqx/emqx-operator/internal/requester"
+	// +kubebuilder:scaffold:imports
+)
+
+// These tests use Ginkgo (BDD-style Go testing framework). Refer to
+// http://onsi.github.io/ginkgo/ to learn more about Ginkgo.
+
+var k8sClient client.WithWatch
+var testEnv *envtest.Environment
+var ctx context.Context
+var cancel context.CancelFunc
+var logger logr.Logger
+
+var emqx *crd.EMQX = &crd.EMQX{
+	ObjectMeta: metav1.ObjectMeta{
+		UID:  "fake-1234567890",
+		Name: "emqx",
+		Labels: map[string]string{
+			crd.LabelManagedBy: "emqx-operator",
+			crd.LabelInstance:  "emqx",
+		},
+	},
+	Spec: crd.EMQXSpec{
+		Image: "emqx",
+		UpdateStrategy: crd.UpdateStrategy{
+			Type: "RollingUpdate",
+			EvacuationStrategy: crd.EvacuationStrategy{
+				Type: "NodeEvacuation",
+			},
+		},
+	},
+}
+
+const (
+	clientFaultModeNone   = "none"
+	clientFaultModeFixed  = "fixed"
+	clientFaultModeRandom = "random"
+)
+
+var (
+	clientFaultMode         string
+	clientFaultRandomEvents = flag.Int(
+		"client-fault-events",
+		10,
+		"number of fault events evaluated when random client faults are simulated",
+	)
+	clientFaultRandomProbability = flag.Float64(
+		"client-fault-probability",
+		0.25,
+		"probability that each random event emits a client fault",
+	)
+)
+
+var baseReconciler *EMQXReconciler
+
+func emqxReconcilerDefault() *EMQXReconciler {
+	r := *baseReconciler
+	return &r
+}
+
+func emqxReconciler() *EMQXReconciler {
+	switch clientFaultMode {
+	case clientFaultModeFixed:
+		r := *baseReconciler
+		r.Handler = handler.NewHandler(newFaultyClient(k8sClient, newFaultEmitter(1, 1)))
+		return &r
+	case clientFaultModeRandom:
+		r := *baseReconciler
+		r.Handler = handler.NewHandler(newFaultyClient(
+			k8sClient,
+			newFaultEmitter(*clientFaultRandomEvents, *clientFaultRandomProbability),
+		))
+		return &r
+	default:
+		return emqxReconcilerDefault()
+	}
+}
+
+func TestControllers(t *testing.T) {
+	RegisterFailHandler(Fail)
+	SetDefaultEventuallyTimeout(time.Second * 10)
+	SetDefaultEventuallyPollingInterval(time.Second)
+	RunSpecs(t, "Controller Suite")
+}
+
+var _ = BeforeSuite(func() {
+	logger = zap.New(
+		zap.WriteTo(GinkgoWriter),
+		zap.UseDevMode(true),
+		zap.Level(zapcore.DebugLevel),
+	)
+	controllerlog.SetLogger(logger)
+
+	ctx, cancel = context.WithCancel(context.TODO())
+
+	By("bootstrapping test environment")
+	testEnv = &envtest.Environment{
+		CRDDirectoryPaths:     []string{filepath.Join("..", "..", "config", "crd", "bases")},
+		ErrorIfCRDPathMissing: true,
+
+		// The BinaryAssetsDirectory is only required if you want to run the tests directly
+		// without call the makefile target test. If not informed it will look for the
+		// default path defined in controller-runtime which is /usr/local/kubebuilder/.
+		// Note that you must have the required binaries setup under the bin directory to perform
+		// the tests directly. When we run make test it will be setup and used automatically.
+		BinaryAssetsDirectory: filepath.Join("..", "..", "bin", "k8s",
+			fmt.Sprintf("1.32.0-%s-%s", runtime.GOOS, runtime.GOARCH)),
+	}
+
+	restConfig, err := testEnv.Start()
+	Expect(err).NotTo(HaveOccurred())
+	Expect(restConfig).NotTo(BeNil())
+
+	err = crd.AddToScheme(scheme.Scheme)
+	Expect(err).NotTo(HaveOccurred())
+
+	// +kubebuilder:scaffold:scheme
+
+	k8sClient, err = client.NewWithWatch(restConfig, client.Options{Scheme: scheme.Scheme})
+	Expect(err).NotTo(HaveOccurred())
+	Expect(k8sClient).NotTo(BeNil())
+
+	baseReconciler = &EMQXReconciler{
+		Handler:       handler.NewHandler(k8sClient),
+		RESTConfig:    restConfig,
+		Scheme:        scheme.Scheme,
+		EventRecorder: &eventLogger{logger},
+	}
+})
+
+var _ = AfterSuite(func() {
+	By("tearing down the test environment")
+	cancel()
+	_ = testEnv.Stop()
+	// err := testEnv.Stop()
+	// Expect(err).NotTo(HaveOccurred())
+})
+
+func actualObject[Object client.Object](o Object) (Object, error) {
+	err := k8sClient.Get(ctx, client.ObjectKeyFromObject(o), o)
+	return o, err
+}
+
+func actualize[Object client.Object](o Object) error {
+	return k8sClient.Get(ctx, client.ObjectKeyFromObject(o), o)
+}
+
+func ownerReferences(owner client.Object) []metav1.OwnerReference {
+	var apiVersion, kind string
+	switch owner.(type) {
+	case *appsv1.StatefulSet:
+		apiVersion = "apps/v1"
+		kind = "StatefulSet"
+	case *appsv1.ReplicaSet:
+		apiVersion = "apps/v1"
+		kind = "ReplicaSet"
+	}
+	return []metav1.OwnerReference{
+		{
+			APIVersion:         apiVersion,
+			Kind:               kind,
+			Name:               owner.GetName(),
+			UID:                owner.GetUID(),
+			BlockOwnerDeletion: ptr.To(true),
+			Controller:         ptr.To(true),
+		},
+	}
+}
+
+func newReconcileRound() *reconcileRound {
+	req := req.MockRequests()
+	return newReconcileRoundWithRequester(req)
+}
+
+func newReconcileRoundWithRequester(requester req.RequesterInterface) *reconcileRound {
+	return &reconcileRound{
+		ctx:            ctx,
+		log:            logger,
+		requester:      &apiRequesterOverride{requester},
+		state:          nil,
+		coreRetirement: nil,
+	}
+}
+
+func ensureReconcileState(round *reconcileRound, instance *crd.EMQX) error {
+	err := reloadReconcileState(round, k8sClient, instance)
+	if err != nil {
+		return err
+	}
+	round.coreRetirement, err = loadCoreSetRetirementState(round)
+	return err
+}
+
+// runRoundReconcile performs reconciler.reconcile under a freshly reloaded (through
+// ensureReconcileState) reconcile round.
+func runRoundReconcile(
+	round *reconcileRound,
+	instance *crd.EMQX,
+	reconciler subReconciler,
+) subResult {
+	err := ensureReconcileState(round, instance)
+	if err != nil {
+		return reconcileError(errors.Wrap(err, "ensureReconcileState"))
+	}
+	return reconciler.reconcile(round, instance)
+}
+
+// apiRequesterOverride always provides the given fixed API requester.
+type apiRequesterOverride struct {
+	requester req.RequesterInterface
+}
+
+func (b *apiRequesterOverride) forCore(_ *reconcileState, _ ...reconcileStatePodFilter) req.RequesterInterface {
+	return b.requester
+}
+
+func (b *apiRequesterOverride) forPod(_ *corev1.Pod) req.RequesterInterface {
+	return b.requester
+}
+
+// apiRequesterUnavailable simulates apiRequester for completely unavailable cluser.
+type apiRequesterUnavailable struct{}
+
+func (b *apiRequesterUnavailable) forCore(_ *reconcileState, _ ...reconcileStatePodFilter) req.RequesterInterface {
+	return nil
+}
+
+func (b *apiRequesterUnavailable) forPod(_ *corev1.Pod) req.RequesterInterface {
+	return nil
+}
+
+// eventLogger is an EventRecorder that simply redirects events into the specified logger instance.
+type eventLogger struct {
+	logger logr.Logger
+}
+
+func (el *eventLogger) writeEvent(
+	object apiruntime.Object,
+	annotations map[string]string,
+	eventtype,
+	reason,
+	message string,
+) {
+	kvs := []any{
+		"type", eventtype,
+		"reason", reason,
+		"message", message,
+	}
+	gvk, err := apiutil.GVKForObject(object, scheme.Scheme)
+	if err == nil {
+		kvs = append(kvs, "gv", gvk.GroupVersion())
+	}
+	if annotations != nil {
+		kvs = append(kvs, "annotations", annotations)
+	}
+	el.logger.Info("controller-event", kvs...)
+}
+
+func (el *eventLogger) Event(object apiruntime.Object, eventtype, reason, message string) {
+	el.writeEvent(object, nil, eventtype, reason, message)
+}
+
+func (el *eventLogger) Eventf(object apiruntime.Object, eventtype, reason, messageFmt string, args ...interface{}) {
+	el.writeEvent(object, nil, eventtype, reason, fmt.Sprintf(messageFmt, args...))
+}
+
+func (el *eventLogger) AnnotatedEventf(
+	object apiruntime.Object,
+	annotations map[string]string,
+	eventtype,
+	reason,
+	messageFmt string,
+	args ...interface{},
+) {
+	el.writeEvent(object, annotations, eventtype, reason, fmt.Sprintf(messageFmt, args...))
+}
+
+// Ginkgo helpers
+
+func DescribeClientFaultMatrix(text string, args ...interface{}) bool {
+	var testf func() = nil
+	var nodeArgs []interface{}
+
+	nodeArgs = append(nodeArgs, Offset(1))
+	for _, arg := range args {
+		if reflect.TypeOf(arg).Kind() == reflect.Func {
+			testf = arg.(func())
+		} else {
+			nodeArgs = append(nodeArgs, arg)
+		}
+	}
+
+	return Describe(text, Ordered, func() {
+		var contextArgs []interface{}
+
+		contextArgs = append(nodeArgs, Label("smoke"), func() {
+			BeforeAll(func() { clientFaultMode = clientFaultModeNone })
+			testf()
+		})
+		Context("client", contextArgs...)
+
+		contextArgs = append(nodeArgs, func() {
+			BeforeAll(func() { clientFaultMode = clientFaultModeRandom })
+			testf()
+		})
+		Context("faulty client", contextArgs...)
+	})
+}
+
+func DeferCleanupObject(object client.Object) {
+	DeferCleanup(func() {
+		Expect(client.IgnoreNotFound(k8sClient.Delete(ctx, object))).To(Succeed())
+	})
+}
+
+// Gomega helpers
+
+type ReconcileResultMatcher interface {
+	matcher() gomegatypes.GomegaMatcher
+}
+
+type Postponed bool
+
+func (p Postponed) matcher() gomegatypes.GomegaMatcher {
+	subm := BeFalse()
+	if p {
+		subm = BeTrue()
+	}
+	return WithTransform(
+		func(in subResult) bool { return in.needRequeue },
+		subm,
+	)
+}
+
+func BeSuccessfulReconcile(extra ...any) gomegatypes.GomegaMatcher {
+	matchers := []gomegatypes.GomegaMatcher{
+		WithTransform(
+			func(in subResult) error { return in.err },
+			Succeed(),
+		),
+	}
+	for _, arg := range extra {
+		argm := arg.(ReconcileResultMatcher)
+		matchers = append(matchers, argm.matcher())
+	}
+	return And(matchers...)
+}

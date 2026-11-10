@@ -1,0 +1,128 @@
+package requester
+
+import (
+	"bytes"
+	"io"
+	"net/http"
+	"net/url"
+	"time"
+
+	emperror "emperror.dev/errors"
+)
+
+type HeaderOpt struct {
+	Key   string
+	Value string
+}
+
+type RequesterInterface interface {
+	// Request resolves the endpoint and returns contextual errors for transport and body-read failures.
+	// Preserves the response when available, including Request.URL identifying the responding endpoint.
+	Request(method string, url url.URL, body []byte, header http.Header) (resp *http.Response, respBody []byte, err error)
+}
+
+type Requester struct {
+	Schema      string
+	Host        string
+	Username    string
+	Password    string
+	Description string
+}
+
+func (requester *Requester) GetUsername() string {
+	return requester.Username
+}
+
+func (requester *Requester) GetPassword() string {
+	return requester.Password
+}
+
+func (requester *Requester) GetHost() string {
+	return requester.Host
+}
+
+func (requester *Requester) GetSchema() string {
+	if requester.Schema == "" {
+		return "http"
+	}
+	return requester.Schema
+}
+
+func (requester *Requester) GetDescription() string {
+	return requester.Description
+}
+
+func (requester *Requester) GetURL(path string, query ...string) url.URL {
+	url := url.URL{
+		Scheme: requester.GetSchema(),
+		Host:   requester.GetHost(),
+		Path:   path,
+	}
+	for _, q := range query {
+		if url.RawQuery == "" {
+			url.RawQuery = q
+			continue
+		}
+		url.RawQuery += "&" + q
+	}
+	return url
+}
+
+var httpClient = &http.Client{
+	Timeout: 10 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:       10,
+		IdleConnTimeout:    30 * time.Second,
+		DisableCompression: true,
+	},
+}
+
+func (requester *Requester) Request(
+	method string,
+	url url.URL,
+	body []byte,
+	header http.Header,
+) (*http.Response, []byte, error) {
+	if url.Scheme == "" {
+		url.Scheme = requester.GetSchema()
+	}
+	if url.Host == "" {
+		url.Host = requester.GetHost()
+	}
+	withContext := func(err error) error {
+		return emperror.Wrapf(err, "error accessing %s API %s", requester.Description, url.String())
+	}
+
+	req, err := http.NewRequest(method, url.String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, nil, withContext(err)
+	}
+
+	for k, v := range header {
+		req.Header[k] = v
+	}
+	if req.Header.Get("Authorization") == "" {
+		req.SetBasicAuth(requester.GetUsername(), requester.GetPassword())
+	}
+	if req.Header.Get("Content-Type") == "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	if req.Header.Get("Accept") == "" {
+		req.Header.Set("Accept", "application/json")
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, nil, withContext(emperror.Wrap(err, "request failed"))
+	}
+
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	body, err = io.ReadAll(resp.Body)
+	if err != nil {
+		return resp, nil, withContext(emperror.Wrap(err, "response body unreadable"))
+	}
+	return resp, body, nil
+}

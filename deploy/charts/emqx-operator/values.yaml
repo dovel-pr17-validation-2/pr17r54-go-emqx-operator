@@ -1,0 +1,67 @@
+# Default values for emqx-operator.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+# If true, CRDs will not be installed.
+skipCRDs: false
+
+# Namespaces the operator watches. Leave empty for cluster-wide watch.
+# To watch only the release namespace, set this to the release namespace.
+watchNamespaces: []
+
+# Development configures the logger to use a Zap development config
+# (stacktraces on warnings, no sampling), otherwise a Zap production
+# config will be used (stacktraces on errors, sampling).
+# NOTE: On by default for 3.0.0 as it changes a lot, a higher risk of
+#       bug reports. Impact is tolerable, usually not much debug output.
+# TODO: Switch off by default in 3.1.0.
+development: true
+
+replicaCount: 1
+
+# The number of old history to retain to allow rollback.
+revisionHistoryLimit: 10
+
+image:
+  repository: ghcr.io/emqx/emqx-operator
+  pullPolicy: IfNotPresent
+  # Overrides the image tag whose default is the chart appVersion.
+  tag: ""
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+serviceAccount:
+  # Specifies whether a service account should be created.
+  create: true
+  # Annotations to add to the service account.
+  annotations: {}
+  # The name of the service account to use.
+  # If not set and create is true, a name is generated using the fullname template.
+  name: ""
+
+podAnnotations: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+    - "ALL"
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 512Mi
+  requests:
+    cpu: 100m
+    memory: 128Mi
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}

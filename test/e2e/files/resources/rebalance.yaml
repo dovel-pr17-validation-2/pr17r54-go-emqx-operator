@@ -1,0 +1,18 @@
+apiVersion: apps.emqx.io/v2beta1
+kind: Rebalance
+metadata:
+  labels:
+    app.kubernetes.io/name: emqx-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: rebalance
+spec:
+  instanceName: emqx
+  rebalanceStrategy:
+    connEvictRate: 1000
+    sessEvictRate: 1000
+    waitTakeover: 1
+    waitHealthCheck: 1
+    absConnThreshold: 1
+    relConnThreshold: "1.1"
+    absSessThreshold: 1
+    relSessThreshold: "1.1"

@@ -1,0 +1,292 @@
+/*
+Copyright 2025-2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package v3beta1
+
+import (
+	"slices"
+
+	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+)
+
+// EMQXStatus defines the observed state of EMQX
+type EMQXStatus struct {
+	// Conditions representing the current status of the EMQX Custom Resource.
+	// +listType=map
+	// +listMapKey=type
+	Conditions []metav1.Condition `json:"conditions,omitempty"`
+
+	// Observed replica count for the core set.
+	CoreReplicas int32 `json:"coreReplicas"`
+
+	// Serialized label selector matching core pods.
+	CoreSelector string `json:"coreSelector,omitempty"`
+
+	// Observed replica count for the replicant set pods.
+	// Used by the scale subresource.
+	ReplicantReplicas int32 `json:"replicantReplicas"`
+
+	// Serialized label selector matching replicant pods.
+	// Used by the scale subresource for HPA pod discovery.
+	ReplicantSelector string `json:"replicantSelector,omitempty"`
+
+	// Summary status of the set of core nodes.
+	CoreNodesStatus CoreNodesStatus `json:"coreNodesStatus,omitempty"`
+	// Summary status of the set of replicant nodes.
+	ReplicantNodesStatus ReplicantNodesStatus `json:"replicantNodesStatus,omitempty"`
+
+	// Observed cluster nodes, including nodes whose role is unknown.
+	ClusterNodes []EMQXNode `json:"clusterNodes,omitempty"`
+	// Status of active node evacuations in the cluster.
+	NodeEvacuations []NodeEvacuationStatus `json:"nodeEvacuations,omitempty"`
+	// Status of EMQX Durable Storage replication.
+	DSReplication DSReplicationStatus `json:"dsReplication,omitempty"`
+
+	// Declarative EMQX configuration reconciliation status.
+	// Fields are informational implementation details. Prefer the ConfigApplied
+	// condition to determine configuration lifecycle state.
+	Config ConfigStatus `json:"config,omitempty"`
+}
+
+// ConfigStatus contains controller-owned reconciliation checkpoints.
+// These fields are informational implementation details and may change.
+type ConfigStatus struct {
+	// Revision of the complete desired configuration in spec.config.roots.
+	DesiredRevision string `json:"desiredRevision,omitempty"`
+	// Revision of runtime configuration most recently accepted by the EMQX API.
+	// Before initial startup, it is the revision staged for cluster bootstrap.
+	RuntimeRevision string `json:"runtimeRevision,omitempty"`
+	// Revision of the desired settings that take effect when EMQX starts.
+	DesiredStartupRevision string `json:"desiredStartupRevision,omitempty"`
+	// Revisions of startup configuration used by ready Pods.
+	// Multiple revisions indicate that ready Pods started with different versions of those settings.
+	ActiveStartupRevisions []string `json:"activeStartupRevisions,omitempty"`
+}
+
+type NodeEvacuationStatus struct {
+	// Evacuated node name
+	// +kubebuilder:example="emqx@10.0.0.1"
+	NodeName string `json:"nodeName,omitempty"`
+	// Evacuation state
+	// +kubebuilder:example=evicting_sessions
+	State string `json:"state,omitempty"`
+	// Session recipients
+	// +kubebuilder:example={"emqx@10.0.0.2", "emqx@10.0.0.3"}
+	SessionRecipients []string `json:"sessionRecipients,omitempty"`
+	// Session eviction rate, in sessions per second.
+	SessionEvictionRate int32 `json:"sessionEvictionRate,omitempty"`
+	// Connection eviction rate, in connections per second.
+	ConnectionEvictionRate int32 `json:"connectionEvictionRate,omitempty"`
+	// Initial number of sessions on this node
+	InitialSessions int32 `json:"initialSessions,omitempty"`
+	// Initial number of connections to this node
+	InitialConnections int32 `json:"initialConnections,omitempty"`
+}
+
+// CoreNodesStatus is the summary status of core nodes managed by a single StatefulSet.
+type CoreNodesStatus struct {
+	// Number of ready replicas.
+	ReadyReplicas int32 `json:"readyReplicas"`
+	// Number of replicas already updated to the desired pod template.
+	UpdatedReplicas int32 `json:"updatedReplicas"`
+	// Number of replicas still running the previous pod template.
+	CurrentReplicas int32 `json:"currentReplicas"`
+}
+
+// ReplicantNodesStatus is the summary status of the set of replicant nodes.
+// The multi-ReplicaSet pattern requires revision tracking at the CR level.
+type ReplicantNodesStatus struct {
+	// Number of ready replicas.
+	ReadyReplicas int32 `json:"readyReplicas"`
+	// Current revision of the replicant set.
+	CurrentRevision string `json:"currentRevision,omitempty"`
+	// Number of replicas running current revision.
+	CurrentReplicas int32 `json:"currentReplicas"`
+	// Update revision of the replicant set.
+	// When different from the current revision, the set is being updated.
+	UpdateRevision string `json:"updateRevision,omitempty"`
+	// Number of replicas running update revision.
+	UpdateReplicas int32 `json:"updateReplicas"`
+
+	CollisionCount *int32 `json:"collisionCount,omitempty"`
+}
+
+type EMQXNode struct {
+	// Node name
+	// +kubebuilder:example="emqx@emqx-core-0.emqx-headless.default.svc.cluster.local"
+	Name string `json:"name,omitempty"`
+	// Corresponding pod name
+	// +kubebuilder:example="emqx-core-0"
+	PodName string `json:"podName,omitempty"`
+	// Node status
+	// +kubebuilder:example=running
+	Status string `json:"status,omitempty"`
+	// Erlang/OTP version node is running on
+	// +kubebuilder:example="27.3.4.2-2/15.2.7.1"
+	OTPRelease string `json:"otpRelease,omitempty"`
+	// EMQX version
+	// +kubebuilder:example="5.10.1"
+	Version string `json:"version,omitempty"`
+	// Node role, either "core" or "replicant", omitted when unknown
+	// +kubebuilder:example=core
+	Role string `json:"role,omitempty"`
+	// Number of MQTT sessions
+	Sessions int64 `json:"sessions"`
+	// Number of connected MQTT clients
+	Connections int64 `json:"connections"`
+}
+
+// HasClusterObservation reports whether the API returned any node reports.
+func (s EMQXStatus) HasClusterObservation() bool {
+	return len(s.ClusterNodes) > 0
+}
+
+func (s EMQXStatus) FindNode(node string) *EMQXNode {
+	for _, n := range s.ClusterNodes {
+		if n.Name == node {
+			return &n
+		}
+	}
+	return nil
+}
+
+func (s EMQXStatus) FindNodeByPodName(pod string) *EMQXNode {
+	if pod == "" {
+		return nil
+	}
+	for _, n := range s.ClusterNodes {
+		if n.PodName == pod {
+			return &n
+		}
+	}
+	return nil
+}
+
+// NodesWithRole selects nodes whose API reports explicitly identify their role.
+func (s EMQXStatus) NodesWithRole(role string) []EMQXNode {
+	var nodes []EMQXNode
+	for _, n := range s.ClusterNodes {
+		if n.Role == role {
+			nodes = append(nodes, n)
+		}
+	}
+	return nodes
+}
+
+func (s EMQXStatus) FindNodeEvacuation(node string) *NodeEvacuationStatus {
+	for _, e := range s.NodeEvacuations {
+		if e.NodeName == node {
+			return &e
+		}
+	}
+	return nil
+}
+
+// Summary of DS replication status per database.
+type DSReplicationStatus struct {
+	DBs []DSDBReplicationStatus `json:"dbs,omitempty"`
+}
+
+type DSDBReplicationStatus struct {
+	// Name of the database
+	// +kubebuilder:example="messages"
+	Name string `json:"name"`
+	// Number of shards of the database
+	// +kubebuilder:example=16
+	NumShards int32 `json:"numShards"`
+	// Total number of shard replicas
+	// +kubebuilder:example=48
+	NumShardReplicas int32 `json:"numShardReplicas"`
+	// Total number of shard replicas belonging to lost sites
+	LostShardReplicas int32 `json:"lostShardReplicas"`
+	// Current number of shard ownership transitions
+	NumTransitions int32 `json:"numTransitions"`
+	// Minimum replication factor among database shards
+	MinReplicas int32 `json:"minReplicas"`
+	// Maximum replication factor among database shards
+	MaxReplicas int32 `json:"maxReplicas"`
+}
+
+const (
+	EMQXAPIAvailable          string = "EMQXAPIAvailable"
+	CoreNodesProgressing      string = "CoreNodesProgressing"
+	ReplicantNodesProgressing string = "ReplicantNodesProgressing"
+	Available                 string = "Available"
+	Ready                     string = "Ready"
+	ConfigApplied             string = "ConfigApplied"
+)
+
+func (s *EMQXStatus) SetCondition(
+	ty string,
+	status metav1.ConditionStatus,
+	reason, message string,
+	observedIn int64,
+) bool {
+	return s.AttachCondition(metav1.Condition{
+		Type:               ty,
+		Status:             status,
+		Reason:             reason,
+		Message:            message,
+		ObservedGeneration: observedIn,
+	})
+}
+
+func (s *EMQXStatus) AttachCondition(condition metav1.Condition) bool {
+	return apimeta.SetStatusCondition(&s.Conditions, condition)
+}
+
+func (s *EMQXStatus) GetCondition(conditionType string) *metav1.Condition {
+	_, cond := s.findCondition(conditionType)
+	return cond
+}
+
+func (s *EMQXStatus) IsConditionTrue(conditionType string) bool {
+	condition := s.GetCondition(conditionType)
+	if condition == nil {
+		return false
+	}
+	return condition.Status == metav1.ConditionTrue
+}
+
+func (s *EMQXStatus) RemoveCondition(conditionType string) {
+	pos, _ := s.findCondition(conditionType)
+	if pos != -1 {
+		s.Conditions = slices.Delete(s.Conditions, pos, pos+1)
+	}
+}
+
+func (s *DSReplicationStatus) IsStable() bool {
+	for _, db := range s.DBs {
+		if db.NumTransitions > 0 {
+			return false
+		}
+		if db.MinReplicas != db.MaxReplicas {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *EMQXStatus) findCondition(conditionType string) (int, *metav1.Condition) {
+	for i := range s.Conditions {
+		c := s.Conditions[i]
+		if c.Type == conditionType {
+			return i, c.DeepCopy()
+		}
+	}
+	return -1, nil
+}

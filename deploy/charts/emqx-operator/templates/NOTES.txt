@@ -1,0 +1,5 @@
+EMQX Operator Controller {{ .Chart.AppVersion }} has been deployed successfully!
+
+The operator is running in namespace: {{ .Release.Namespace }}
+
+Now you can create EMQX Custom Resources to deploy EMQX clusters.

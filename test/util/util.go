@@ -1,0 +1,232 @@
+/*
+Copyright 2025-2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package util
+
+import (
+	"bytes"
+	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"slices"
+	"strings"
+
+	jsonpatch "github.com/evanphx/json-patch"
+	"github.com/lithammer/dedent"
+	ginkgo "github.com/onsi/ginkgo/v2"
+	"sigs.k8s.io/yaml"
+)
+
+const (
+	metricsServerYAML = "test/e2e/files/resources/metrics-server.yaml"
+
+	prometheusOperatorVersion = "v0.77.1"
+	prometheusOperatorURL     = "https://github.com/prometheus-operator/prometheus-operator/" +
+		"releases/download/" + prometheusOperatorVersion + "/bundle.yaml"
+
+	certmanagerVersion = "v1.16.0"
+	certmanagerURL     = "https://github.com/jetstack/cert-manager/" +
+		"releases/download/" + certmanagerVersion + "/cert-manager.yaml"
+)
+
+func warnError(err error) {
+	ginkgo.GinkgoWriter.Printf("warning: %v\n", err)
+}
+
+// Kubectl runs a kubectl command, and returns an error if the command fails.
+func Kubectl(args ...string) error {
+	_, err := run(exec.Command("kubectl", args...), nil)
+	return err
+}
+
+func KubectlStdin(stdin []byte, args ...string) error {
+	cmd := exec.Command("kubectl", args...)
+	_, err := run(cmd, stdin)
+	return err
+}
+
+// KubectlOut runs a kubectl command, and returns the output of the command.
+func KubectlOut(args ...string) (string, error) {
+	return run(exec.Command("kubectl", args...), nil)
+}
+
+// Run executes the provided command within this context
+func Run(executable string, args ...string) error {
+	cmd := exec.Command(executable, args...)
+	_, err := run(cmd, nil)
+	return err
+}
+
+// Output executes the provided command within this context, and returns the output of the command.
+func Output(executable string, args ...string) (string, error) {
+	return run(exec.Command(executable, args...), nil)
+}
+
+// Run executes the provided command within this context
+func run(cmd *exec.Cmd, stdin []byte) (string, error) {
+	dir, _ := GetProjectDir()
+	cmd.Dir = dir
+
+	if err := os.Chdir(cmd.Dir); err != nil {
+		warnError(err)
+	}
+
+	cmd.Env = append(os.Environ(), "GO111MODULE=on")
+	command := strings.Join(cmd.Args, " ")
+	ginkgo.GinkgoWriter.Print("running: ", command)
+	if stdin != nil {
+		cmd.Stdin = bytes.NewReader(stdin)
+		ginkgo.GinkgoWriter.Print(" < ", string(stdin))
+	}
+	ginkgo.GinkgoWriter.Println()
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return string(output), fmt.Errorf("%s failed with error: (%v) %s", command, err, string(output))
+	}
+
+	return string(output), nil
+}
+
+func Env(name string, defaultValue string) string {
+	if value, ok := os.LookupEnv(name); ok {
+		return value
+	}
+	return defaultValue
+}
+
+func FromYAMLFile(filePath string) []byte {
+	document, err := os.ReadFile(filePath)
+	if err != nil {
+		panic(err)
+	}
+	return FromYAML(document)
+}
+
+func FromYAMLString(document string) []byte {
+	document = strings.ReplaceAll(document, "\t", "    ")
+	document = dedent.Dedent(document)
+	return FromYAML([]byte(document))
+}
+
+func FromYAML(document []byte) []byte {
+	json, err := yaml.YAMLToJSON(document)
+	if err != nil {
+		panic(err)
+	}
+	return json
+}
+
+func PatchDocument(document []byte, patches ...[]byte) []byte {
+	var err error
+	var patched []byte
+	if len(patches) == 0 {
+		return slices.Clone(document)
+	}
+	patched = document
+	for _, p := range patches {
+		patched, err = jsonpatch.MergePatch(patched, p)
+		if err != nil {
+			panic(err)
+		}
+	}
+	return patched
+}
+
+func InstallMetricsServer() error {
+	err := Kubectl("apply", "-f", metricsServerYAML)
+	if err != nil {
+		return err
+	}
+	return Kubectl("wait", "deployment", "metrics-server",
+		"--for", "condition=Available",
+		"--namespace", "kube-system",
+		"--timeout", "1m",
+	)
+}
+
+func UninstallMetricsServer() {
+	err := Kubectl("delete", "-f", metricsServerYAML)
+	if err != nil {
+		warnError(err)
+	}
+}
+
+// InstallPrometheusOperator installs the prometheus Operator to be used to export the enabled metrics.
+func InstallPrometheusOperator() error {
+	return Kubectl("create", "-f", prometheusOperatorURL)
+}
+
+// UninstallPrometheusOperator uninstalls the prometheus
+func UninstallPrometheusOperator() {
+	err := Kubectl("delete", "-f", prometheusOperatorURL)
+	if err != nil {
+		warnError(err)
+	}
+}
+
+// InstallCertManager installs the cert manager bundle.
+func InstallCertManager() error {
+	err := Kubectl("apply", "-f", certmanagerURL)
+	if err != nil {
+		return err
+	}
+	// Wait for cert-manager-webhook to be ready, which can take time if cert-manager
+	// was re-installed after uninstalling on a cluster.
+	return Kubectl("wait", "deployment", "cert-manager-webhook",
+		"--for", "condition=Available",
+		"--namespace", "cert-manager",
+		"--timeout", "5m",
+	)
+}
+
+// UninstallCertManager uninstalls the cert manager
+func UninstallCertManager() {
+	err := Kubectl("delete", "-f", certmanagerURL)
+	if err != nil {
+		warnError(err)
+	}
+}
+
+// LoadImageToKindClusterWithName loads a local docker image to the kind cluster
+func LoadImageToKindClusterWithName(name string) error {
+	cluster := "test-e2e"
+	if v, ok := os.LookupEnv("KIND_CLUSTER"); ok {
+		cluster = v
+	}
+	return Run("kind", "load", "docker-image", name, "--name", cluster)
+}
+
+// GetProjectDir will return the directory where the project is.
+// It walks up from the current working directory until it finds a go.mod file.
+func GetProjectDir() (string, error) {
+	wd, err := os.Getwd()
+	if err != nil {
+		return wd, err
+	}
+	dir := wd
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			// Reached filesystem root without finding go.mod
+			return wd, fmt.Errorf("could not find project root (go.mod) from %s", wd)
+		}
+		dir = parent
+	}
+}

@@ -1,0 +1,570 @@
+package controller
+
+import (
+	"cmp"
+	"fmt"
+	"slices"
+
+	emperror "emperror.dev/errors"
+	crd "github.com/emqx/emqx-operator/api/v3beta1"
+	config "github.com/emqx/emqx-operator/internal/controller/config"
+	"github.com/emqx/emqx-operator/internal/emqx/api"
+	appsv1 "k8s.io/api/apps/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/klog/v2"
+)
+
+// Responsibilities:
+// - Reflects aggregate state of the managed EMQX cluster in the `.status` subresource.
+//
+// On each reconciliation status is built from:
+//  1. Conditions and few auxiliary status fields preserved from previous reconciliations.
+//  2. State of managed K8S resources aggregated into basic status fields.
+//  3. Information on cluster nodes, node evacuations and DS replication sourced from EMQX API.
+//     If EMQX API is unavailable these fields will remain empty; unavailability will be reflected
+//     in the respective status condition.
+//  4. Re-evaluated conditions.
+//  5. Target and applied onfiguration revisions.
+type updateStatus struct {
+	*EMQXReconciler
+}
+
+func (u *updateStatus) reconcile(r *reconcileRound, instance *crd.EMQX) subResult {
+	status := u.inheritStatus(instance)
+	hasReplicants := instance.Spec.HasReplicants() || r.state.hasReplicants()
+
+	configRoots := instance.Spec.Config.Roots
+	_, startupRoots := config.SplitRoots(configRoots)
+	status.Config.DesiredRevision = configRevision(configRoots)
+	status.Config.DesiredStartupRevision = startupConfigRevision(startupRoots)
+	for revision := range r.state.activeStartupConfigRevisions() {
+		status.Config.ActiveStartupRevisions = append(status.Config.ActiveStartupRevisions, revision)
+	}
+	slices.Sort(status.Config.ActiveStartupRevisions)
+
+	// Core: count pods on each revision for rolling update progress.
+	coreSet := r.state.coreSet()
+	status.CoreSelector = labels.Set(instance.DefaultLabelsWith(crd.CoreLabels())).String()
+	if coreSet != nil {
+		status.CoreReplicas = coreSet.Status.Replicas
+		for _, pod := range r.state.podsManagedBy(coreSet) {
+			if r.state.partOfCoreSetRevision(pod, coreSet.Status.UpdateRevision) {
+				status.CoreNodesStatus.UpdatedReplicas++
+			}
+			if r.state.partOfCoreSetRevision(pod, coreSet.Status.CurrentRevision) {
+				status.CoreNodesStatus.CurrentReplicas++
+			}
+		}
+	}
+
+	if hasReplicants {
+		status.ReplicantSelector = labels.Set(instance.DefaultLabelsWith(crd.ReplicantLabels())).String()
+		status.ReplicantReplicas = r.state.numReplicants()
+	}
+
+	// Replicant: multi-ReplicaSet pattern retained.
+	var currentReplicantSet, updateReplicantSet *appsv1.ReplicaSet
+	if hasReplicants {
+		currentReplicantSet, updateReplicantSet = switchReplicantSet(r, instance)
+	}
+
+	status.ReplicantNodesStatus.ReadyReplicas = 0
+	if currentReplicantSet != nil {
+		status.ReplicantNodesStatus.CurrentRevision = currentReplicantSet.Labels[crd.LabelPodTemplateHash]
+		status.ReplicantNodesStatus.CurrentReplicas = currentReplicantSet.Status.Replicas
+	}
+	if updateReplicantSet != nil {
+		status.ReplicantNodesStatus.UpdateRevision = updateReplicantSet.Labels[crd.LabelPodTemplateHash]
+		status.ReplicantNodesStatus.UpdateReplicas = updateReplicantSet.Status.Replicas
+	}
+
+	var apiError error
+	req := r.preferredCoreRequester()
+
+	// 1. Reflect EMQX cluster nodes information.
+	if req != nil {
+		nodes, err := api.Nodes(req)
+		if err != nil {
+			apiError = err
+			req = nil
+		}
+		status.ClusterNodes = u.getEMQXNodeList(r, instance, nodes)
+	}
+
+	// 2. Report node evacuation status.
+	if req != nil {
+		clusterEvacuationsStatus, err := api.ClusterEvacuationStatus(req)
+		if err != nil {
+			apiError = err
+			req = nil
+		}
+		for _, ns := range clusterEvacuationsStatus {
+			status.NodeEvacuations = append(status.NodeEvacuations, crd.NodeEvacuationStatus{
+				NodeName:               ns.Node,
+				State:                  ns.State,
+				SessionRecipients:      ns.SessionRecipients,
+				SessionEvictionRate:    ns.SessionEvictionRate,
+				ConnectionEvictionRate: ns.ConnectionEvictionRate,
+				// Stats
+				InitialSessions:    ns.Stats.InitialSessions,
+				InitialConnections: ns.Stats.InitialConnected,
+			})
+		}
+	}
+
+	// 3. Reflect the status of the DS replication.
+	if req != nil {
+		dsReplicationStatus, err := api.GetDSReplicationStatus(req)
+		if err != nil {
+			apiError = err
+			req = nil
+		}
+		status.DSReplication.DBs = make([]crd.DSDBReplicationStatus, len(dsReplicationStatus.DBs))
+		for i, db := range dsReplicationStatus.DBs {
+			minReplicas := 0
+			maxReplicas := 0
+			numTransitions := 0
+			numShardReplicas := 0
+			lostShardReplicas := 0
+			if len(db.Shards) > 0 {
+				minReplicas = len(db.Shards[0].Replicas)
+				maxReplicas = len(db.Shards[0].Replicas)
+			}
+			for _, shard := range db.Shards {
+				minReplicas = min(minReplicas, len(shard.Replicas))
+				maxReplicas = max(maxReplicas, len(shard.Replicas))
+				numTransitions += len(shard.Transitions)
+				numShardReplicas += len(shard.Replicas)
+				for _, replica := range shard.Replicas {
+					if replica.Status == "lost" {
+						lostShardReplicas += 1
+					}
+				}
+			}
+			status.DSReplication.DBs[i] = crd.DSDBReplicationStatus{
+				Name:              db.Name,
+				NumShards:         int32(len(db.Shards)),
+				NumShardReplicas:  int32(numShardReplicas),
+				LostShardReplicas: int32(lostShardReplicas),
+				NumTransitions:    int32(numTransitions),
+				MinReplicas:       int32(minReplicas),
+				MaxReplicas:       int32(maxReplicas),
+			}
+		}
+	}
+
+	if coreSet != nil {
+		_, running := tallyClusterNodes(r.state, &status, podsOfCoreSet(r.state))
+		status.CoreNodesStatus.ReadyReplicas = running
+	}
+	if hasReplicants {
+		_, running := tallyClusterNodes(r.state, &status, podsOfReplicantSets(r.state))
+		status.ReplicantNodesStatus.ReadyReplicas = running
+	}
+
+	switch {
+	case apiError != nil:
+		status.SetCondition(
+			crd.EMQXAPIAvailable,
+			metav1.ConditionFalse,
+			"RequestFailed",
+			apiError.Error(),
+			instance.Generation,
+		)
+	case req == nil:
+		status.SetCondition(
+			crd.EMQXAPIAvailable,
+			metav1.ConditionFalse,
+			"NoRequester",
+			"No eligible core pod is available to serve EMQX API requests",
+			instance.Generation,
+		)
+	default:
+		status.SetCondition(
+			crd.EMQXAPIAvailable,
+			metav1.ConditionTrue,
+			"RequestSucceeded",
+			"EMQX API is available",
+			instance.Generation,
+		)
+	}
+
+	// update status condition
+	instance.Status = status
+	u.evaluateStatusConditions(r.state, instance)
+
+	if err := u.Client.Status().Update(r.ctx, instance); err != nil {
+		return subResult{err: emperror.Wrap(err, "failed to update status")}
+	}
+	return subResult{}
+}
+
+// inheritStatus builds a minimal EMQXStatus with information that has to be
+// preserved across reconcile rounds.
+func (u *updateStatus) inheritStatus(instance *crd.EMQX) crd.EMQXStatus {
+	status := crd.EMQXStatus{
+		Conditions:   u.inheritConditions(instance),
+		ClusterNodes: []crd.EMQXNode{},
+		Config: crd.ConfigStatus{
+			RuntimeRevision: instance.Status.Config.RuntimeRevision,
+		},
+	}
+	if instance.Spec.HasReplicants() {
+		status.ReplicantNodesStatus = crd.ReplicantNodesStatus{
+			CollisionCount: instance.Status.ReplicantNodesStatus.CollisionCount,
+		}
+	}
+	return status
+}
+
+func (*updateStatus) inheritConditions(instance *crd.EMQX) []metav1.Condition {
+	if instance.Spec.HasReplicants() {
+		return append([]metav1.Condition(nil), instance.Status.Conditions...)
+	}
+	next := make([]metav1.Condition, 0, len(instance.Status.Conditions))
+	for _, condition := range instance.Status.Conditions {
+		if condition.Type == crd.ReplicantNodesProgressing {
+			continue
+		}
+		next = append(next, condition)
+	}
+	return next
+}
+
+// evaluateStatusConditions evaluates all conditions independently from current state.
+func (*updateStatus) evaluateStatusConditions(s *reconcileState, instance *crd.EMQX) {
+	evaluateCoreNodesProgressing(s, instance)
+	evaluateReplicantNodesProgressing(s, instance)
+	evaluateAvailable(s, instance)
+	evaluateReady(s, instance)
+}
+
+func evaluateCoreNodesProgressing(s *reconcileState, instance *crd.EMQX) {
+	cond := crd.CoreNodesProgressing
+	status := &instance.Status
+
+	coreSet := s.coreSet()
+	if coreSet == nil {
+		status.SetCondition(cond, metav1.ConditionTrue,
+			"Create",
+			"spinning up core set",
+			instance.Generation,
+		)
+		return
+	}
+
+	desired := instance.Spec.NumCoreReplicas()
+	updated := coreSet.Status.UpdatedReplicas
+	total := coreSet.Status.Replicas
+
+	switch {
+	case total < desired:
+		status.SetCondition(cond, metav1.ConditionTrue,
+			"ScalingUp",
+			fmt.Sprintf("%d/%d core pods", total, desired),
+			instance.Generation,
+		)
+	case total > desired:
+		status.SetCondition(cond, metav1.ConditionTrue,
+			"ScalingDown",
+			fmt.Sprintf("%d/%d core pods", total, desired),
+			instance.Generation,
+		)
+	case updated < desired:
+		status.SetCondition(cond, metav1.ConditionTrue,
+			"RollingUpdate",
+			fmt.Sprintf("%d/%d core pods updated", updated, desired),
+			instance.Generation,
+		)
+	default:
+		status.SetCondition(cond, metav1.ConditionFalse,
+			"Converged",
+			fmt.Sprintf("%d core pods up to date", desired),
+			instance.Generation,
+		)
+	}
+}
+
+func forceCoreNodesProgressing(instance *crd.EMQX) {
+	instance.Status.SetCondition(crd.CoreNodesProgressing, metav1.ConditionTrue,
+		"RollingUpdate",
+		"0 core pods updated",
+		instance.Generation,
+	)
+	instance.Status.SetCondition(crd.Ready, metav1.ConditionFalse,
+		"CoreNodesProgressing",
+		"Core nodes are progressing",
+		instance.Generation,
+	)
+}
+
+func evaluateReplicantNodesProgressing(s *reconcileState, instance *crd.EMQX) {
+	cond := crd.ReplicantNodesProgressing
+	status := &instance.Status
+
+	if !instance.Spec.HasReplicants() && !s.hasReplicants() {
+		return
+	}
+
+	updateSet := s.updateReplicantSet(instance)
+	if updateSet == nil {
+		status.SetCondition(cond, metav1.ConditionTrue,
+			"Create",
+			"spinning up replicant set",
+			instance.Generation,
+		)
+		return
+	}
+
+	desired := instance.Spec.NumReplicantReplicas()
+	currentRevision := status.ReplicantNodesStatus.CurrentRevision
+	updateRevision := status.ReplicantNodesStatus.UpdateRevision
+	total := updateSet.Status.Replicas
+
+	switch {
+	case currentRevision != updateRevision:
+		currentSet := s.currentReplicantSet(instance)
+		currentReplicas := total
+		if currentSet != nil && currentSet.Spec.Replicas != nil {
+			currentReplicas = *currentSet.Spec.Replicas
+		}
+		status.SetCondition(cond, metav1.ConditionTrue,
+			"RollingUpdate",
+			fmt.Sprintf("%d/%d replicant pods updated", total-currentReplicas, total),
+			instance.Generation,
+		)
+	case total > desired:
+		status.SetCondition(cond, metav1.ConditionTrue,
+			"ScalingDown",
+			fmt.Sprintf("%d/%d replicant pods", total, desired),
+			instance.Generation,
+		)
+	case total < desired:
+		status.SetCondition(cond, metav1.ConditionTrue,
+			"ScalingUp",
+			fmt.Sprintf("%d/%d replicant pods", total, desired),
+			instance.Generation,
+		)
+	default:
+		status.SetCondition(cond, metav1.ConditionFalse,
+			"Converged",
+			fmt.Sprintf("%d replicant pods up to date", desired),
+			instance.Generation,
+		)
+	}
+}
+
+func forceReplicantNodesProgressing(instance *crd.EMQX) {
+	instance.Status.SetCondition(crd.ReplicantNodesProgressing, metav1.ConditionTrue,
+		"RollingUpdate",
+		"0 replicant pods updated",
+		instance.Generation,
+	)
+	instance.Status.SetCondition(crd.Ready, metav1.ConditionFalse,
+		"ReplicantNodesProgressing",
+		"Replicant nodes are progressing",
+		instance.Generation,
+	)
+}
+
+func evaluateAvailable(s *reconcileState, instance *crd.EMQX) {
+	cond := crd.Available
+	status := &instance.Status
+	if instance.Spec.HasReplicants() {
+		desired := instance.Spec.NumReplicantReplicas()
+		available := s.numAvailableReplicants()
+		if available >= desired {
+			status.SetCondition(cond, metav1.ConditionTrue,
+				"ReplicantPodsAvailable",
+				fmt.Sprintf("%d/%d replicant pods available", available, desired),
+				instance.Generation,
+			)
+		} else {
+			status.SetCondition(cond, metav1.ConditionFalse,
+				"ReplicantPodsUnavailable",
+				fmt.Sprintf("%d/%d replicant pods available", available, desired),
+				instance.Generation,
+			)
+		}
+	} else {
+		coreSet := s.coreSet()
+		desired := instance.Spec.NumCoreReplicas()
+		available := int32(0)
+		if coreSet != nil {
+			available = coreSet.Status.AvailableReplicas
+		}
+		if available >= desired {
+			status.SetCondition(cond, metav1.ConditionTrue,
+				"CorePodsAvailable",
+				fmt.Sprintf("%d/%d core pods available", available, desired),
+				instance.Generation,
+			)
+		} else {
+			status.SetCondition(cond, metav1.ConditionFalse,
+				"CorePodsUnavailable",
+				fmt.Sprintf("%d/%d core pods available", available, desired),
+				instance.Generation,
+			)
+		}
+	}
+}
+
+func evaluateReady(s *reconcileState, instance *crd.EMQX) {
+	status := &instance.Status
+	if !evaluateCoresReady(s, instance) {
+		status.SetCondition(crd.Ready, metav1.ConditionFalse,
+			"CoreNodesProgressing",
+			"Core nodes are progressing",
+			instance.Generation,
+		)
+		return
+	}
+	if instance.Spec.HasReplicants() || s.hasReplicants() {
+		if !evaluateReplicantsReady(s, instance) {
+			status.SetCondition(crd.Ready, metav1.ConditionFalse,
+				"ReplicantNodesProgressing",
+				"Replicant nodes are progressing",
+				instance.Generation,
+			)
+			return
+		}
+	}
+	if !instance.Status.DSReplication.IsStable() {
+		status.SetCondition(crd.Ready, metav1.ConditionFalse,
+			"DSReplicationProgressing",
+			"Durable storage membership transitions are in progress",
+			instance.Generation,
+		)
+		return
+	}
+	status.SetCondition(crd.Ready, metav1.ConditionTrue,
+		"Ready",
+		"Cluster is ready",
+		instance.Generation,
+	)
+}
+
+func evaluateCoresReady(s *reconcileState, instance *crd.EMQX) bool {
+	desired := instance.Spec.NumCoreReplicas()
+	coreSet := s.coreSet()
+	if coreSet == nil {
+		return false
+	}
+	numPods, numRunningNodes := tallyClusterNodes(s, &instance.Status, podsOfCoreSet(s))
+	return coreSet.Status.Replicas == desired &&
+		coreSet.Status.ReadyReplicas == desired &&
+		coreSet.Status.UpdatedReplicas == desired &&
+		numPods == desired &&
+		numRunningNodes == desired
+}
+
+func evaluateReplicantsReady(s *reconcileState, instance *crd.EMQX) bool {
+	desired := instance.Spec.NumReplicantReplicas()
+	replicantSet := s.updateReplicantSet(instance)
+	if replicantSet == nil && desired > 0 {
+		return false
+	}
+	numUpdatedReplicas := int32(0)
+	numReadyReplicas := int32(0)
+	if replicantSet != nil {
+		numUpdatedReplicas = replicantSet.Status.Replicas
+		numReadyReplicas = replicantSet.Status.ReadyReplicas
+	}
+	numPods, numRunningNodes := tallyClusterNodes(s, &instance.Status, podsOfReplicantSets(s))
+	return s.numReplicants() == desired &&
+		numUpdatedReplicas == desired &&
+		numReadyReplicas == desired &&
+		numPods == desired &&
+		numRunningNodes == desired
+}
+
+func switchReplicantSet(
+	r *reconcileRound,
+	instance *crd.EMQX,
+) (*appsv1.ReplicaSet, *appsv1.ReplicaSet) {
+	current := r.state.currentReplicantSet(instance)
+	update := r.state.updateReplicantSet(instance)
+	if (current == nil || current.Status.Replicas == 0) && update != nil {
+		current = nil
+		for _, replicantSet := range r.state.replicantSets {
+			// Adopt oldest non-empty replicantSet if there are more than 2 (current and update) replicantSets:
+			if replicantSet.UID != update.UID && replicantSet.Status.Replicas > 0 {
+				r.log.V(1).Info("adopting non-empty current replicantSet", "replicaSet", klog.KObj(replicantSet))
+				current = replicantSet
+				break
+			}
+		}
+		if current == nil {
+			r.log.V(1).Info("switching update -> current replicantSet", "replicaSet", klog.KObj(update))
+			current = update
+		}
+	}
+	return current, update
+}
+
+func (u *updateStatus) getEMQXNodeList(r *reconcileRound, instance *crd.EMQX, nodes []api.EMQXNode) []crd.EMQXNode {
+	list := make([]crd.EMQXNode, 0, len(nodes))
+	slices.SortFunc(nodes, func(a, b api.EMQXNode) int {
+		// Use seconds granularity to avoid jitter in ordering
+		asec := a.Uptime / 1000
+		bsec := b.Uptime / 1000
+		if asec == bsec {
+			return cmp.Compare(a.Node, b.Node)
+		}
+		return cmp.Compare(asec, bsec)
+	})
+	for _, n := range nodes {
+		node := crd.EMQXNode{
+			Name:        n.Node,
+			Status:      n.NodeStatus,
+			OTPRelease:  n.OTPRelease,
+			Version:     n.Version,
+			Role:        n.Role,
+			Sessions:    n.Connections,
+			Connections: n.LiveConnections,
+		}
+		if parsed := parseNodeName(n.Node, instance); parsed != nil {
+			for _, pod := range r.state.pods {
+				// A core pod:
+				if parsed.podName == pod.Name {
+					node.PodName = pod.Name
+					break
+				}
+				// Likely a replicant pod:
+				if parsed.hostName == pod.Status.PodIP && pod.Status.PodIP != "" {
+					node.PodName = pod.Name
+					break
+				}
+			}
+		}
+		list = append(list, node)
+	}
+	return list
+}
+
+// tallyClusterNodes counts managed Pods with a corresponding running EMQX nodes,
+// according to the set of cluster nodes obtained through EMQX Nodes API.
+// Foreign and duplicate entries are ignored.
+func tallyClusterNodes(
+	s *reconcileState,
+	status *crd.EMQXStatus,
+	filters ...reconcileStatePodFilter,
+) (int32, int32) {
+	total := int32(0)
+	running := int32(0)
+	filterAlive := podsAlive{}
+	for _, pod := range s.listPods(filters...) {
+		total++
+		if !filterAlive.passes(pod) {
+			continue
+		}
+		for _, node := range status.ClusterNodes {
+			if node.PodName == pod.Name && node.Status == api.NodeStatusRunning {
+				running++
+				break
+			}
+		}
+	}
+	return total, running
+}

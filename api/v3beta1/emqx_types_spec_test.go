@@ -1,0 +1,120 @@
+/*
+Copyright 2026.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package v3beta1
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
+)
+
+func TestRolloutMaxUnavailable(t *testing.T) {
+	emqx := &EMQX{
+		Spec: EMQXSpec{
+			ReplicantTemplate: EMQXReplicantTemplate{
+				Spec: EMQXReplicantTemplateSpec{Replicas: ptr.To(int32(10))},
+			},
+		},
+	}
+	assert.Equal(t, int32(1), emqx.Spec.NumMaxUnavailableReplicantReplicas())
+
+	emqx.Spec.UpdateStrategy.Replicants = &ReplicantsUpdateStrategy{
+		MaxUnavailable: ptr.To(intstr.FromString("50%")),
+	}
+	assert.Equal(t, int32(5), emqx.Spec.NumMaxUnavailableReplicantReplicas())
+}
+
+func TestRolloutMaxSurge(t *testing.T) {
+	emqx := &EMQX{
+		Spec: EMQXSpec{
+			ReplicantTemplate: EMQXReplicantTemplate{
+				Spec: EMQXReplicantTemplateSpec{Replicas: ptr.To(int32(3))},
+			},
+		},
+	}
+	assert.Equal(t, int32(0), emqx.Spec.NumMaxSurgeReplicantReplicas())
+
+	emqx.Spec.UpdateStrategy.Replicants = &ReplicantsUpdateStrategy{
+		MaxSurge: ptr.To(intstr.FromInt(2)),
+	}
+	assert.Equal(t, int32(2), emqx.Spec.NumMaxSurgeReplicantReplicas())
+}
+
+func TestRolloutPercentageRounding(t *testing.T) {
+	spec := EMQXSpec{
+		ReplicantTemplate: EMQXReplicantTemplate{
+			Spec: EMQXReplicantTemplateSpec{Replicas: ptr.To(int32(10))},
+		},
+		UpdateStrategy: UpdateStrategy{Replicants: &ReplicantsUpdateStrategy{
+			MaxUnavailable: ptr.To(intstr.FromString("39%")),
+			MaxSurge:       ptr.To(intstr.FromString("39%")),
+		}},
+	}
+	assert.Equal(t, int32(3), spec.NumMaxUnavailableReplicantReplicas())
+	assert.Equal(t, int32(4), spec.NumMaxSurgeReplicantReplicas())
+
+	spec.ReplicantTemplate.Spec.Replicas = ptr.To(int32(1))
+	assert.Equal(t, int32(0), spec.NumMaxUnavailableReplicantReplicas())
+	assert.Equal(t, int32(1), spec.NumMaxSurgeReplicantReplicas())
+}
+
+func TestRolloutZeroBudgetFallback(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		replicas int32
+		surge    *intstr.IntOrString
+	}{
+		{"rounded unavailable with zero surge", 10, ptr.To(intstr.FromInt(0))},
+		{"rounded unavailable with omitted surge", 10, nil},
+		{"zero replicas with percentage surge", 0, ptr.To(intstr.FromString("1%"))},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := EMQXSpec{
+				ReplicantTemplate: EMQXReplicantTemplate{
+					Spec: EMQXReplicantTemplateSpec{Replicas: ptr.To(tt.replicas)},
+				},
+				UpdateStrategy: UpdateStrategy{Replicants: &ReplicantsUpdateStrategy{
+					MaxUnavailable: ptr.To(intstr.FromString("1%")),
+					MaxSurge:       tt.surge,
+				}},
+			}
+			assert.Equal(t, int32(1), spec.NumMaxUnavailableReplicantReplicas())
+			assert.Equal(t, int32(0), spec.NumMaxSurgeReplicantReplicas())
+		})
+	}
+}
+
+func TestServiceTemplateIsEnabled(t *testing.T) {
+	tests := []struct {
+		name     string
+		template *ServiceTemplate
+		enabled  bool
+	}{
+		{name: "absent template", template: nil, enabled: true},
+		{name: "enabled omitted", template: &ServiceTemplate{}, enabled: true},
+		{name: "explicitly enabled", template: &ServiceTemplate{Enabled: ptr.To(true)}, enabled: true},
+		{name: "explicitly disabled", template: &ServiceTemplate{Enabled: ptr.To(false)}, enabled: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.enabled, tt.template.IsEnabled())
+		})
+	}
+}

@@ -1,0 +1,429 @@
+package controller
+
+import (
+	"fmt"
+	"slices"
+
+	emperror "emperror.dev/errors"
+	crd "github.com/emqx/emqx-operator/api/v3beta1"
+	util "github.com/emqx/emqx-operator/internal/controller/util"
+	"github.com/emqx/emqx-operator/internal/emqx/api"
+	corev1 "k8s.io/api/core/v1"
+	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/klog/v2"
+)
+
+// Responsibilities:
+// - Scaling the core set up according to specified number of replicas.
+// - Scaling the core set down safely according to specified number of replicas.
+//   - Safety: availability is maintained.
+//     Loss of availability of a single, next-in-line replica is tolerated.
+//   - Safety: connections and sessions are evacuated first.
+//   - Safety: existing DS shard replicas prevent scaling until all replicas are migrated.
+//     See `dsUpdateReplicaSets` reconciler.
+//
+// - Conducting safe pod-by-pod in-place rolling update of the core set.
+//   - Safety: availability is maintained.
+//   - Safety: connections and sessions are evacuated first.
+//
+// - Terminating evacuations on updated cores.
+//
+// NOTE
+// As evacuation state is expected to survive pod recreation, evacuations need to be
+// terminated manually. Currently, this reconciler can not tell the difference between
+// evacuations started by itself and manually by the user, latter will be stopped on the
+// next reconcile.
+type syncCoreSet struct {
+	*EMQXReconciler
+}
+
+func (s *syncCoreSet) reconcile(r *reconcileRound, instance *crd.EMQX) subResult {
+	coreSet := r.state.coreSet()
+	if coreSet == nil {
+		return reconcilePostpone()
+	}
+
+	desiredReplicas := instance.Spec.NumCoreReplicas()
+	currentReplicas := util.NumReplicas(coreSet)
+
+	// Handle scale-downs and await retirement convergence.
+	// May extend the retirement range by one ordinal.
+	// Converged retirement enables safe scale-ups / rolling updates. Additionally, retries
+	// removals of any pods that were supposed to be removed by scaleDown.
+	if currentReplicas > desiredReplicas || r.coreRetirement.watermark > currentReplicas {
+		if currentReplicas > desiredReplicas {
+			r.log.V(1).Info("scaling down coreSet",
+				"statefulSet", klog.KObj(coreSet),
+				"from", currentReplicas,
+				"to", desiredReplicas,
+				"watermark", r.coreRetirement.watermark,
+			)
+		} else {
+			r.log.V(1).Info("awaiting coreSet retirement",
+				"statefulSet", klog.KObj(coreSet),
+				"replicas", currentReplicas,
+				"watermark", r.coreRetirement.watermark,
+			)
+		}
+		return s.scaleDown(r, instance, currentReplicas)
+	}
+
+	// Handle scale-up after all ordinals being restored have been authorized for reuse.
+	if currentReplicas < desiredReplicas {
+		r.log.V(1).Info("scaling up coreSet",
+			"statefulSet", klog.KObj(coreSet),
+			"from", currentReplicas,
+			"to", desiredReplicas,
+			"watermark", r.coreRetirement.watermark,
+		)
+		return s.scaleUp(r, desiredReplicas)
+	}
+
+	// Stop evacuations of any updated pods.
+	// This is done irrespective of whether Node Evacuation is enabled or not,
+	// to avoid ending up in transient state if it was disabled mid-update.
+	err := s.updateEvacuationState(r, instance)
+	if err != nil {
+		return reconcileError(emperror.Wrap(err, "failed to update evacuation state"))
+	}
+
+	// Handle rolling update: replace outdated pods one at a time, highest ordinal first.
+	return s.rollingUpdate(r, instance)
+}
+
+// rollingUpdate detects outdated core pods and replaces them one at a time,
+// starting from the highest ordinal. Each pod is evacuated before deletion.
+func (s *syncCoreSet) rollingUpdate(r *reconcileRound, instance *crd.EMQX) subResult {
+	// Sort outdated pods by ordinal ascending; pick highest ordinal last.
+	outdated := r.state.listOutdatedPods()
+	sortByOrdinal(outdated)
+
+	if len(outdated) == 0 {
+		return subResult{}
+	}
+
+	r.log.V(1).Info("rolling coreSet update",
+		"statefulSet", klog.KObj(r.state.coreSet()),
+		"outdatedPods", len(outdated),
+	)
+
+	candidate := outdated[len(outdated)-1]
+
+	if instance.Spec.HasReplicants() &&
+		instance.Status.ReplicantNodesStatus.CurrentRevision != instance.Status.ReplicantNodesStatus.UpdateRevision {
+		// ReplicantSet is in the process of update.
+		// Keep at least one old-version core alive so current-revision replicants can rejoin.
+		if len(outdated) == 1 {
+			return s.onAdmission(r, instance, candidate, admission{
+				Action: admissionWait,
+				Reason: "current replicantSet still migrating",
+				Cause:  rollingUpdate,
+			})
+		}
+	}
+
+	admission := checkCorePodRemoval(r, instance, candidate, rollingUpdate)
+	return s.onAdmission(r, instance, candidate, admission)
+}
+
+func (s *syncCoreSet) scaleUp(r *reconcileRound, desiredReplicas int32) subResult {
+	coreSet := r.state.coreSet()
+	r.coreRetirement = newCoreSetRetirementState(desiredReplicas)
+	util.SetReplicas(coreSet, desiredReplicas)
+	util.AttachAnnotations(coreSet, r.coreRetirement.annotations())
+	err := s.Client.Update(r.ctx, coreSet)
+	if err != nil {
+		return subResult{err: emperror.Wrap(err, "failed to scale up coreSet")}
+	}
+	return subResult{}
+}
+
+// scaleDown reconciles deletion of already-retiring pods, then, if needed,
+// admits one more ordinal and decrements the StatefulSet replica count.
+func (s *syncCoreSet) scaleDown(r *reconcileRound, instance *crd.EMQX, currentReplicas int32) subResult {
+	var candidate *corev1.Pod
+	var coreAdmission admission
+
+	coreSet := r.state.coreSet()
+	desiredReplicas := instance.Spec.NumCoreReplicas()
+	watermark := r.coreRetirement.watermark
+
+	// Remove pods that were supposed to be removed in previous reconciliations.
+	if watermark > currentReplicas {
+		for n := watermark; n > currentReplicas; n-- {
+			pod := r.state.podWithName(fmt.Sprintf("%s-%d", coreSet.Name, n-1))
+			if pod != nil && pod.DeletionTimestamp == nil {
+				coreAdmission = admission{
+					Action: admissionRemove,
+					Reason: "removal already admitted",
+					Cause:  scaleDown,
+				}
+				result := s.onAdmission(r, instance, pod, coreAdmission)
+				result.needRequeue = true
+				return result
+			}
+		}
+	}
+
+	// Candidate is the highest-ordinal pod, where ordinal = currentReplicas-1.
+	if currentReplicas > desiredReplicas {
+		candidate = r.state.podWithName(fmt.Sprintf("%s-%d", coreSet.Name, currentReplicas-1))
+	} else {
+		return reconcilePostpone()
+	}
+
+	if candidate != nil {
+		coreAdmission = checkCorePodRemoval(r, instance, candidate, scaleDown)
+	} else {
+		coreAdmission = admission{
+			Action: admissionRemove,
+			Reason: "already terminated",
+			Cause:  scaleDown,
+		}
+	}
+
+	if coreAdmission.Action == admissionRemove {
+		// Decrement StatefulSet replica count first so the StatefulSet controller
+		// won't recreate the pod after we delete it.
+		if r.coreRetirement.watermark == currentReplicas {
+			r.coreRetirement = newCoreSetRetirementState(currentReplicas)
+		}
+		util.SetReplicas(coreSet, currentReplicas-1)
+		util.AttachAnnotations(coreSet, r.coreRetirement.annotations())
+		err := s.Client.Update(r.ctx, coreSet)
+		if err != nil {
+			return subResult{err: emperror.Wrap(err, "failed to decrement coreSet replicas")}
+		}
+	}
+	if candidate != nil {
+		return s.onAdmission(r, instance, candidate, coreAdmission)
+	}
+	return subResult{}
+}
+
+// Stops evacuation on nodes that are no longer need to evacuate anything:
+// nodes that belong to the most recent coreSet revision.
+func (s *syncCoreSet) updateEvacuationState(r *reconcileRound, instance *crd.EMQX) error {
+	updateRevision := r.state.coreSet().Status.UpdateRevision
+	for _, evacuation := range instance.Status.NodeEvacuations {
+		if evacuation.State != api.EvacuationStateProhibiting {
+			continue
+		}
+		node := instance.Status.FindNode(evacuation.NodeName)
+		if node == nil || node.Role != crd.RoleCore || node.PodName == "" {
+			continue
+		}
+		pod := r.state.podWithName(node.PodName)
+		if pod != nil && r.state.partOfCoreSetRevision(pod, updateRevision) {
+			err := api.StopEvacuation(r.requester.forPod(pod), node.Name)
+			if err == nil {
+				s.EventRecorder.Event(
+					instance,
+					corev1.EventTypeNormal,
+					"NodeEvacuation",
+					fmt.Sprintf("Node %s evacuation stopped", node.Name),
+				)
+			} else {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// checkCorePodRemoval is a pure function that decides whether a core pod can
+// be safely removed. It inspects instance status and pod state but performs no
+// side effects.
+//
+// When cause is coreScaleDown, the pod is being permanently removed: data would
+// be lost so there are extra safety checks (e.g. DS replication site).
+func checkCorePodRemoval(
+	r *reconcileRound,
+	instance *crd.EMQX,
+	pod *corev1.Pod,
+	cause admissionCause,
+) admission {
+	status := &instance.Status
+	admission := admission{Cause: cause}
+
+	// Disallow removing pod if other cores just recently became ready.
+	numAvailableCores := int32(0)
+	for _, p := range r.state.listPods(podsManagedBy{r.state.coreSet()}, podsAlive{}) {
+		if p.GetUID() != pod.GetUID() && util.IsPodAvailable(p, instance.Spec.CoreTemplate.Spec.MinReadySeconds) {
+			numAvailableCores++
+		}
+	}
+	if numAvailableCores < instance.Spec.NumCoreReplicas()-1 {
+		return admission.wait("cores are not available yet")
+	}
+
+	// If a pod is already being deleted, return it.
+	if pod.DeletionTimestamp != nil {
+		return admission.wait("pod %s deletion in progress", pod.Name)
+	}
+
+	// Disallow permanently removing the pod that is still a DS replication site.
+	if cause == scaleDown {
+		dsCondition := util.FindPodCondition(pod, crd.DSReplicationSite)
+		if dsCondition != nil && dsCondition.Status != corev1.ConditionFalse {
+			return admission.wait("pod %s is still a DS replication site", pod.Name)
+		}
+	}
+
+	nodeInfo := status.FindNodeByPodName(pod.Name)
+
+	switch {
+	case nodeInfo == nil:
+		return admission.remove("node is out of cluster")
+	case nodeInfo.Status == api.NodeStatusStopped:
+		return admission.remove("node is already stopped")
+	case nodeInfo.Status == api.NodeStatusUnreachable:
+		return admission.wait("node is unreachable")
+	}
+
+	evacuation := status.FindNodeEvacuation(nodeInfo.Name)
+	if evacuation != nil && evacuation.State != api.EvacuationStateProhibiting {
+		return admission.wait("node evacuation in progress")
+	}
+
+	if nodeInfo.Sessions > 0 && instance.Spec.IsEvacuationEnabled() {
+		if instance.Spec.NumCoreReplicas() == 1 && !instance.Spec.HasReplicants() {
+			return admission.remove("node %s has active sessions nowhere to evacuate", nodeInfo.Name)
+		}
+		return admission.evacuate("node %s has active sessions", nodeInfo.Name)
+	}
+
+	return admission.remove("node is safe to stop")
+}
+
+// onAdmission performs the side effects implied by an admission.
+func (s *syncCoreSet) onAdmission(
+	r *reconcileRound,
+	instance *crd.EMQX,
+	candidate *corev1.Pod,
+	coreAdmission admission,
+) subResult {
+	switch coreAdmission.Action {
+	case admissionRemove:
+		r.log.V(1).Info("removing core pod",
+			"reason", coreAdmission.Reason,
+			"pod", klog.KObj(candidate),
+			"statefulSet", klog.KObj(r.state.coreSet()),
+			"cause", coreAdmission.Cause,
+		)
+		if err := s.deleteCorePod(r, candidate); err != nil {
+			return reconcileError(emperror.Wrap(err, "failed to delete core pod"))
+		}
+	case admissionWait:
+		r.log.V(1).Info("removal of core pod postponed",
+			"reason", coreAdmission.Reason,
+			"pod", klog.KObj(candidate),
+			"statefulSet", klog.KObj(r.state.coreSet()),
+			"cause", coreAdmission.Cause,
+		)
+	case admissionEvacuate:
+		err := s.startEvacuation(r, instance, candidate)
+		if err != nil {
+			return subResult{err: emperror.WrapWithDetails(err,
+				"failed to start node evacuation",
+				"pod", klog.KObj(candidate),
+				"statefulSet", klog.KObj(r.state.coreSet()),
+				"cause", coreAdmission.Cause,
+			)}
+		}
+	}
+	return subResult{}
+}
+
+func (s *syncCoreSet) deleteCorePod(r *reconcileRound, pod *corev1.Pod) error {
+	if pod.DeletionTimestamp == nil {
+		err := s.Client.Delete(r.ctx, pod)
+		if err != nil && !k8sErrors.IsNotFound(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// actOnCoreAdmission performs the side effects implied by a coreAdmission.
+// Currently this only handles coreAdmitEvacuate by calling the evacuation API.
+func (s *syncCoreSet) startEvacuation(
+	r *reconcileRound,
+	instance *crd.EMQX,
+	pod *corev1.Pod,
+) error {
+	nodeInfo := instance.Status.FindNodeByPodName(pod.Name)
+	if nodeInfo == nil {
+		return emperror.New("no corresponding node in cluster status")
+	}
+	nodeName := nodeInfo.Name
+	strategy := instance.Spec.UpdateStrategy.EvacuationStrategy
+	migrateTo := migrationTargetNodes(r, instance)
+	migrateTo = slices.DeleteFunc(
+		migrateTo,
+		func(e string) bool { return e == nodeInfo.Name },
+	)
+	if len(migrateTo) == 0 {
+		s.EventRecorder.Event(
+			instance,
+			corev1.EventTypeWarning,
+			"NodeEvacuation",
+			fmt.Sprintf("Node %s evacuation skipped: no nodes to migrate to", nodeName),
+		)
+		return nil
+	}
+	err := api.StartEvacuation(r.requester.forPod(pod), strategy, migrateTo, nodeName)
+	if err != nil {
+		return err
+	}
+	s.EventRecorder.Event(
+		instance,
+		corev1.EventTypeNormal,
+		"NodeEvacuation",
+		fmt.Sprintf("Node %s evacuation started", nodeName),
+	)
+	return nil
+}
+
+// migrationTargetNodes returns the list of EMQX nodes to migrate workloads to.
+// * In core-only cluster, targets are pods of the core set.
+// * In core-replicant cluster, targets are:
+//   - pods in the "update" replicant set, if it has at least 1 node up and running,
+//   - pods in any replicant set otherwise.
+func migrationTargetNodes(r *reconcileRound, instance *crd.EMQX) []string {
+	targets := []string{}
+	fallback := []string{}
+	if instance.Spec.NumReplicantReplicas() > 0 {
+		updateReplicantSet := r.state.updateReplicantSet(instance)
+		if updateReplicantSet == nil {
+			return targets
+		}
+		for _, node := range instance.Status.ClusterNodes {
+			pod := r.state.podWithName(node.PodName)
+			if pod == nil || podRole(pod) != crd.RoleReplicant {
+				continue
+			}
+			if _, ok := pod.Annotations[crd.AnnotationScalingDown]; ok {
+				continue
+			}
+			if util.IsPodManagedBy(pod, updateReplicantSet) {
+				targets = append(targets, node.Name)
+			}
+			fallback = append(fallback, node.Name)
+		}
+		if len(targets) == 0 {
+			return fallback
+		}
+	} else {
+		for _, node := range instance.Status.ClusterNodes {
+			pod := r.state.podWithName(node.PodName)
+			if pod == nil {
+				continue
+			}
+			if r.state.partOfCoreSet(pod) {
+				targets = append(targets, node.Name)
+			}
+		}
+	}
+	return targets
+}

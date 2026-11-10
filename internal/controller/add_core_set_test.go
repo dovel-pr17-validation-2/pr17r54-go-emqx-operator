@@ -1,0 +1,273 @@
+package controller
+
+import (
+	"testing"
+
+	crd "github.com/emqx/emqx-operator/api/v3beta1"
+	"github.com/emqx/emqx-operator/test/util"
+	"github.com/stretchr/testify/assert"
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	apiextv1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/utils/ptr"
+)
+
+func TestGetNewStatefulSet(t *testing.T) {
+	instance := &crd.EMQX{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "emqx",
+			Namespace: "emqx",
+			Labels: map[string]string{
+				"emqx-label-key": "emqx-label-value",
+			},
+			Annotations: map[string]string{
+				"emqx-annotation-key": "emqx-annotation-value",
+			},
+		},
+		Spec: crd.EMQXSpec{
+			Image:         "emqx/emqx:5.1",
+			ClusterDomain: "cluster.local",
+		},
+	}
+	instance.Spec.CoreTemplate.TemplateObjectMeta = crd.TemplateObjectMeta{
+		Labels: map[string]string{
+			"core-label-key": "core-label-value",
+		},
+		Annotations: map[string]string{
+			"core-annotation-key": "core-annotation-value",
+		},
+	}
+	instance.Spec.CoreTemplate.Spec.Replicas = ptr.To(int32(3))
+
+	t.Run("check metadata", func(t *testing.T) {
+		emqx := instance.DeepCopy()
+		got := newStatefulSet(emqx)
+
+		assert.Equal(t, "core-annotation-value", got.Annotations["core-annotation-key"])
+		assert.Equal(t, "core-label-value", got.Labels["core-label-key"])
+		assert.Equal(t, "emqx", got.Labels[crd.LabelInstance])
+		assert.Equal(t, "emqx-operator", got.Labels[crd.LabelManagedBy])
+		assert.Equal(t, "core", got.Labels[crd.LabelMriaRole])
+		// Single StatefulSet: name is deterministic, no hash suffix.
+		assert.Equal(t, "emqx-core", got.Name)
+		assert.Equal(t, emqx.Namespace, got.Namespace)
+	})
+
+	t.Run("check selector and pod metadata", func(t *testing.T) {
+		emqx := instance.DeepCopy()
+		got := newStatefulSet(emqx)
+		assert.Equal(t, emqx.Spec.CoreTemplate.Annotations, got.Spec.Template.Annotations)
+		assert.EqualValues(t, map[string]string{
+			crd.LabelInstance:  "emqx",
+			crd.LabelManagedBy: "emqx-operator",
+			crd.LabelMriaRole:  "core",
+			"core-label-key":   "core-label-value",
+		}, got.Spec.Template.Labels)
+
+		assert.EqualValues(t, map[string]string{
+			crd.LabelInstance:  "emqx",
+			crd.LabelManagedBy: "emqx-operator",
+			crd.LabelMriaRole:  "core",
+		}, got.Spec.Selector.MatchLabels)
+	})
+
+	t.Run("check update strategy is OnDelete", func(t *testing.T) {
+		emqx := instance.DeepCopy()
+		got := newStatefulSet(emqx)
+		assert.Equal(t, appsv1.OnDeleteStatefulSetStrategyType, got.Spec.UpdateStrategy.Type)
+		assert.EqualValues(t, int32(0), got.Spec.MinReadySeconds)
+	})
+
+	t.Run("check PVC retention policy deletes on scale-down and sts deletion", func(t *testing.T) {
+		emqx := instance.DeepCopy()
+		got := newStatefulSet(emqx)
+		assert.NotNil(t, got.Spec.PersistentVolumeClaimRetentionPolicy)
+		assert.Equal(t,
+			appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
+			got.Spec.PersistentVolumeClaimRetentionPolicy.WhenScaled,
+		)
+		assert.Equal(t,
+			appsv1.DeletePersistentVolumeClaimRetentionPolicyType,
+			got.Spec.PersistentVolumeClaimRetentionPolicy.WhenDeleted,
+		)
+	})
+
+	t.Run("check bootstrap API keys", func(t *testing.T) {
+		emqx := instance.DeepCopy()
+		rs := newStatefulSet(emqx)
+		got := []corev1.EnvVar{}
+		for _, env := range rs.Spec.Template.Spec.Containers[0].Env {
+			if env.Name == "EMQX_API_KEY__BOOTSTRAP_FILE" {
+				got = append(got, env)
+			}
+		}
+		assert.NotEmpty(t, got)
+	})
+
+	t.Run("check http port", func(t *testing.T) {
+		emqx := instance.DeepCopy()
+		emqx.Spec.Config.Roots = crd.ConfigRoots{
+			"dashboard": apiextv1.JSON{Raw: util.FromYAMLString(`
+				listeners:
+					http:
+						bind: 18083
+			`)},
+		}
+		got := newStatefulSet(emqx)
+
+		assert.Contains(t, got.Spec.Template.Spec.Containers[0].Ports,
+			corev1.ContainerPort{
+				Name:          "dashboard",
+				Protocol:      corev1.ProtocolTCP,
+				ContainerPort: 18083,
+			},
+		)
+	})
+
+	t.Run("check https port", func(t *testing.T) {
+		emqx := instance.DeepCopy()
+		emqx.Spec.Config.Roots = crd.ConfigRoots{
+			"dashboard": apiextv1.JSON{Raw: util.FromYAMLString(`
+				listeners:
+					http:
+						bind: 0
+					https:
+						bind: 18084
+			`)},
+		}
+		got := newStatefulSet(emqx)
+		assert.Contains(t, got.Spec.Template.Spec.Containers[0].Ports,
+			corev1.ContainerPort{
+				Name:          "dashboard-https",
+				Protocol:      corev1.ProtocolTCP,
+				ContainerPort: 18084,
+			},
+		)
+	})
+
+	t.Run("check http and https port", func(t *testing.T) {
+		emqx := instance.DeepCopy()
+		emqx.Spec.Config.Roots = crd.ConfigRoots{
+			"dashboard": apiextv1.JSON{Raw: util.FromYAMLString(`
+				listeners:
+					http:
+						bind: 18083
+					https:
+						bind: 18084
+			`)},
+		}
+		got := newStatefulSet(emqx)
+		assert.Contains(t, got.Spec.Template.Spec.Containers[0].Ports,
+			corev1.ContainerPort{
+				Name:          "dashboard",
+				Protocol:      corev1.ProtocolTCP,
+				ContainerPort: 18083,
+			},
+		)
+		assert.Contains(t, got.Spec.Template.Spec.Containers[0].Ports,
+			corev1.ContainerPort{
+				Name:          "dashboard-https",
+				Protocol:      corev1.ProtocolTCP,
+				ContainerPort: 18084,
+			},
+		)
+	})
+
+	t.Run("check dnsConfig propagation", func(t *testing.T) {
+		emqx := instance.DeepCopy()
+		emqx.Spec.CoreTemplate.Spec.DNSConfig = &corev1.PodDNSConfig{
+			Nameservers: []string{"1.1.1.1"},
+			Options: []corev1.PodDNSConfigOption{
+				{Name: "ndots", Value: ptr.To("3")},
+			},
+		}
+		got := generateStatefulSet(emqx)
+		assert.Equal(t, emqx.Spec.CoreTemplate.Spec.DNSConfig, got.Spec.Template.Spec.DNSConfig)
+	})
+
+	t.Run("check default volume claim templates", func(t *testing.T) {
+		emqx := instance.DeepCopy()
+
+		fs := corev1.PersistentVolumeFilesystem
+		got := generateStatefulSet(emqx)
+		assert.Equal(t, []corev1.PersistentVolumeClaim{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "emqx-core-data",
+					Namespace: "emqx",
+					Labels: map[string]string{
+						crd.LabelMriaRole:  "core",
+						crd.LabelInstance:  "emqx",
+						crd.LabelManagedBy: "emqx-operator",
+					},
+				},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes: []corev1.PersistentVolumeAccessMode{
+						corev1.ReadWriteOnce,
+					},
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("500Mi"),
+						},
+					},
+					VolumeMode: &fs,
+				},
+			},
+		}, got.Spec.VolumeClaimTemplates)
+		assert.NotContains(t, got.Spec.Template.Spec.Volumes, corev1.Volume{
+			Name: "emqx-core-data",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		})
+	})
+
+	t.Run("check explicit volume claim templates", func(t *testing.T) {
+		emqx := instance.DeepCopy()
+		emqx.Spec.CoreTemplate.Spec.PersistentVolumeClaimSpec = corev1.PersistentVolumeClaimSpec{
+			AccessModes: []corev1.PersistentVolumeAccessMode{
+				corev1.ReadWriteOnce,
+			},
+			Resources: corev1.VolumeResourceRequirements{
+				Requests: corev1.ResourceList{
+					corev1.ResourceStorage: resource.MustParse("1Gi"),
+				},
+			},
+		}
+
+		fs := corev1.PersistentVolumeFilesystem
+		got := generateStatefulSet(emqx)
+		assert.Equal(t, []corev1.PersistentVolumeClaim{
+			{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "emqx-core-data",
+					Namespace: "emqx",
+					Labels: map[string]string{
+						crd.LabelMriaRole:  "core",
+						crd.LabelInstance:  "emqx",
+						crd.LabelManagedBy: "emqx-operator",
+					},
+				},
+				Spec: corev1.PersistentVolumeClaimSpec{
+					AccessModes: []corev1.PersistentVolumeAccessMode{
+						corev1.ReadWriteOnce,
+					},
+					Resources: corev1.VolumeResourceRequirements{
+						Requests: corev1.ResourceList{
+							corev1.ResourceStorage: resource.MustParse("1Gi"),
+						},
+					},
+					VolumeMode: &fs,
+				},
+			},
+		}, got.Spec.VolumeClaimTemplates)
+		assert.NotContains(t, got.Spec.Template.Spec.Volumes, corev1.Volume{
+			Name: "emqx-core-data",
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{},
+			},
+		})
+	})
+}

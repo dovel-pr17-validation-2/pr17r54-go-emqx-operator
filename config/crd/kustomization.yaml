@@ -1,0 +1,6 @@
+resources:
+- bases/apps.emqx.io_emqxes.yaml
+# - bases/apps.emqx.io_rebalances.yaml
+# +kubebuilder:scaffold:crdkustomizeresource
+
+patches: []

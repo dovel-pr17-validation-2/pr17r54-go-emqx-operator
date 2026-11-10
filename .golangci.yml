@@ -1,0 +1,43 @@
+version: "2"
+run:
+  allow-parallel-runners: true
+linters:
+  default: standard
+  enable:
+    - copyloopvar
+    - dupl
+    - errcheck
+    - ginkgolinter
+    - goconst
+    - govet
+    - ineffassign
+    - lll
+    - misspell
+    - nakedret
+    - prealloc
+    - revive
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+  settings:
+    dupl:
+      threshold: 200
+    goconst:
+      min-len: 5
+      min-occurrences: 5
+      ignore-tests: true
+    revive:
+      rules:
+        - name: comment-spacings
+  exclusions:
+    generated: lax
+    rules:
+      - linters: [lll]
+        path: api/
+      - linters: [goconst, prealloc]
+        path: _test\.go
+formatters:
+  enable:
+    - gofmt
+    - goimports

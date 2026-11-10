@@ -1,0 +1,182 @@
+{{- $watchNamespaces := default (list) .Values.watchNamespaces -}}
+{{- $watchNamespaces = $watchNamespaces | uniq -}}
+{{- define "emqx-operator.managerRules" }}
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - secrets
+  - services
+  verbs:
+  - create
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - events
+  verbs:
+  - create
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - persistentvolumeclaims
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - delete
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods/exec
+  verbs:
+  - create
+- apiGroups:
+  - ""
+  resources:
+  - pods/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - ""
+  resources:
+  - pods/status
+  verbs:
+  - patch
+- apiGroups:
+  - apps
+  resources:
+  - replicasets
+  - statefulsets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - update
+  - watch
+- apiGroups:
+  - apps.emqx.io
+  resources:
+  - emqxes
+  - rebalances
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - apps.emqx.io
+  resources:
+  - emqxes/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - apps.emqx.io
+  resources:
+  - emqxes/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - create
+  - get
+  - list
+  - update
+  - watch
+{{- end }}
+{{- if .Values.serviceAccount.create -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "emqx-operator.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "emqx-operator.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+{{- if gt (len $watchNamespaces) 0 }}
+{{- range $namespace := $watchNamespaces }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "emqx-operator.fullname" $ }}-manager-role
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "emqx-operator.labels" $ | nindent 4 }}
+{{ include "emqx-operator.managerRules" $ }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "emqx-operator.fullname" $ }}-manager-rolebinding
+  namespace: {{ $namespace }}
+  labels:
+    {{- include "emqx-operator.labels" $ | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "emqx-operator.fullname" $ }}-manager-role
+subjects:
+- kind: ServiceAccount
+  name: {{ include "emqx-operator.serviceAccountName" $ }}
+  namespace: {{ $.Release.Namespace }}
+{{- end }}
+{{- else }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "emqx-operator.fullname" . }}-manager-role
+  labels:
+    {{- include "emqx-operator.labels" . | nindent 4 }}
+{{ include "emqx-operator.managerRules" . }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "emqx-operator.fullname" . }}-manager-rolebinding
+  labels:
+    {{- include "emqx-operator.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "emqx-operator.fullname" . }}-manager-role
+subjects:
+- kind: ServiceAccount
+  name: {{ include "emqx-operator.serviceAccountName" . }}
+  namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}
